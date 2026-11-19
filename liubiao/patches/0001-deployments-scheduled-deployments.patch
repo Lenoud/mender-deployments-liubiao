@@ -1,0 +1,790 @@
+diff --git a/backend/services/deployments/api/http/api_deployments.go b/backend/services/deployments/api/http/api_deployments.go
+index 604341e2..f7e23524 100644
+--- a/backend/services/deployments/api/http/api_deployments.go
++++ b/backend/services/deployments/api/http/api_deployments.go
+@@ -149,8 +149,14 @@ type Config struct {
+ 	// related to releases; helpful in performing long-running maintenance and data
+ 	// migrations on the artifacts and releases collections.
+ 	DisableNewReleasesFeature bool
++
++	// liubiao: 计划部署开始时间的上限（相对当前时间）
++	ScheduleMaxAhead time.Duration
+ }
+ 
++// liubiao: 与 dconfig.SettingScheduleMaxAheadDefault 一致
++const DefaultScheduleMaxAhead = 72 * time.Hour
++
+ func NewConfig() *Config {
+ 	return &Config{
+ 		PresignExpire:       DefaultDownloadLinkExpire,
+@@ -158,7 +164,16 @@ func NewConfig() *Config {
+ 		MaxImageSize:        DefaultMaxImageSize,
+ 		MaxGenerateDataSize: DefaultMaxGenerateDataSize,
+ 		MaxRequestSize:      dconfig.SettingMaxRequestSizeDefault,
++		ScheduleMaxAhead:    DefaultScheduleMaxAhead,
++	}
++}
++
++// SetScheduleMaxAhead liubiao: 设置计划部署开始时间上限；非正值保留默认值。
++func (conf *Config) SetScheduleMaxAhead(maxAhead time.Duration) *Config {
++	if maxAhead > 0 {
++		conf.ScheduleMaxAhead = maxAhead
+ 	}
++	return conf
+ }
+ 
+ func (conf *Config) SetPresignSecret(key []byte) *Config {
+@@ -250,6 +265,9 @@ func NewDeploymentsApiHandlers(
+ 		if c.MaxRequestSize > 0 {
+ 			conf.MaxRequestSize = c.MaxRequestSize
+ 		}
++		if c.ScheduleMaxAhead > 0 { // liubiao
++			conf.ScheduleMaxAhead = c.ScheduleMaxAhead
++		}
+ 		conf.DisableNewReleasesFeature = c.DisableNewReleasesFeature
+ 		conf.EnableDirectUpload = c.EnableDirectUpload
+ 		conf.EnableDirectUploadSkipVerify = c.EnableDirectUploadSkipVerify
+@@ -1232,6 +1250,11 @@ func (d *DeploymentsApiHandlers) getDeploymentConstructorFromBody(
+ 		return nil, err
+ 	}
+ 
++	// liubiao: 计划部署只支持单阶段，开始时间不能超过上限
++	if err := constructor.ValidateSchedule(time.Now(), d.config.ScheduleMaxAhead); err != nil {
++		return nil, err
++	}
++
+ 	return constructor, nil
+ }
+ 
+@@ -1672,6 +1695,8 @@ func ParseLookupQuery(vals url.Values) (model.Query, error) {
+ 		query.Status = model.StatusQueryPending
+ 	case "aborted":
+ 		query.Status = model.StatusQueryAborted
++	case "scheduled": // liubiao: 未到开始时间的计划部署
++		query.Status = model.StatusQueryScheduled
+ 	case "":
+ 		query.Status = model.StatusQueryAny
+ 	default:
+diff --git a/backend/services/deployments/api/http/schedule_liubiao_test.go b/backend/services/deployments/api/http/schedule_liubiao_test.go
+new file mode 100644
+index 00000000..1a22e78c
+--- /dev/null
++++ b/backend/services/deployments/api/http/schedule_liubiao_test.go
+@@ -0,0 +1,131 @@
++// Copyright 2026 Skyris liubiao
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++package http
++
++import (
++	"context"
++	"net/http"
++	"net/url"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/mock"
++
++	rtest "github.com/mendersoftware/mender-server/pkg/testing/rest"
++
++	mapp "github.com/mendersoftware/mender-server/services/deployments/app/mocks"
++	"github.com/mendersoftware/mender-server/services/deployments/model"
++	"github.com/mendersoftware/mender-server/services/deployments/utils/restutil"
++	"github.com/mendersoftware/mender-server/services/deployments/utils/restutil/view"
++)
++
++func TestParseLookupQueryScheduled(t *testing.T) {
++	t.Parallel()
++	query, err := ParseLookupQuery(url.Values{"status": []string{"scheduled"}})
++	assert.NoError(t, err)
++	assert.Equal(t, model.StatusQueryScheduled, query.Status)
++}
++
++// liubiao：创建计划部署时校验单阶段与开始时间上限（默认 72 小时，可配置）。
++func TestPostScheduledDeployment(t *testing.T) {
++	t.Parallel()
++	phase := func(start time.Time, extra map[string]interface{}) []map[string]interface{} {
++		p := map[string]interface{}{"batch_size": 100, "start_ts": start.Format(time.RFC3339), "delay": 0}
++		for k, v := range extra {
++			p[k] = v
++		}
++		return []map[string]interface{}{p}
++	}
++	body := func(phases interface{}) map[string]interface{} {
++		return map[string]interface{}{
++			"name":          "dev",
++			"artifact_name": "app-1.0",
++			"devices":       []string{"f826484e-1157-4109-af21-304e6d711560"},
++			"phases":        phases,
++		}
++	}
++	now := time.Now()
++
++	testCases := []struct {
++		Name      string
++		Body      interface{}
++		MaxAhead  time.Duration
++		Code      int
++		ErrSubstr string
++	}{{
++		Name: "ok, within default 72h",
++		Body: body(phase(now.Add(48*time.Hour), nil)),
++		Code: http.StatusCreated,
++	}, {
++		Name:      "error, beyond default 72h",
++		Body:      body(phase(now.Add(80*time.Hour), nil)),
++		Code:      http.StatusBadRequest,
++		ErrSubstr: "计划开始时间最多只能在 72 小时之后",
++	}, {
++		Name:     "ok, configured limit",
++		Body:     body(phase(now.Add(80*time.Hour), nil)),
++		MaxAhead: 96 * time.Hour,
++		Code:     http.StatusCreated,
++	}, {
++		Name:      "error, configured limit",
++		Body:      body(phase(now.Add(30*time.Hour), nil)),
++		MaxAhead:  24 * time.Hour,
++		Code:      http.StatusBadRequest,
++		ErrSubstr: "计划开始时间最多只能在 24 小时之后",
++	}, {
++		Name:      "error, partial batch",
++		Body:      body(phase(now.Add(time.Hour), map[string]interface{}{"batch_size": 50})),
++		Code:      http.StatusBadRequest,
++		ErrSubstr: model.ErrScheduleBatchSize.Error(),
++	}, {
++		Name: "error, two phases",
++		Body: body(append(phase(now.Add(time.Hour), map[string]interface{}{"batch_size": 50}),
++			phase(now.Add(2*time.Hour), nil)...)),
++		Code:      http.StatusBadRequest,
++		ErrSubstr: model.ErrScheduleMultiplePhases.Error(),
++	}}
++	for _, tc := range testCases {
++		tc := tc
++		t.Run(tc.Name, func(t *testing.T) {
++			t.Parallel()
++			app := &mapp.App{}
++			app.On("CreateDeployment",
++				mock.MatchedBy(func(ctx context.Context) bool { return true }),
++				mock.MatchedBy(func(c *model.DeploymentConstructor) bool {
++					return c.StartTime() != nil && len(c.Phases) == 1
++				}),
++			).Return("foo", nil)
++			d := NewDeploymentsApiHandlers(nil, new(view.RESTView), app,
++				NewConfig().SetScheduleMaxAhead(tc.MaxAhead))
++			router := setUpTestRouter()
++			router.POST(ApiUrlManagementDeployments, d.PostDeployment)
++			req := rtest.MakeTestRequest(&rtest.TestRequest{
++				Method: "POST",
++				Path:   "http://localhost" + ApiUrlManagementDeployments,
++				Body:   tc.Body,
++			})
++
++			recorded := restutil.RunRequest(t, router, req)
++			assert.Equal(t, tc.Code, recorded.Recorder.Code)
++			if tc.ErrSubstr != "" {
++				assert.Contains(t, recorded.Recorder.Body.String(), tc.ErrSubstr)
++				app.AssertNotCalled(t, "CreateDeployment", mock.Anything, mock.Anything)
++			} else {
++				app.AssertExpectations(t)
++			}
++		})
++	}
++}
+diff --git a/backend/services/deployments/app/app.go b/backend/services/deployments/app/app.go
+index 7363511e..054e5274 100644
+--- a/backend/services/deployments/app/app.go
++++ b/backend/services/deployments/app/app.go
+@@ -1441,6 +1441,11 @@ func (d *Deployments) getNewDeploymentForDevice(ctx context.Context,
+ 			return nil, nil, errors.Wrap(err, "Failed to search for newer active deployments")
+ 		}
+ 		if deploy != nil {
++			// liubiao: 与企业版一致，设备最早的未完成部署还没到开始时间时不返回任何部署，
++			// 也不跳过它去取更新的部署：跳过后设备只会往更新的部署之后找，计划部署就永远不会下发。
++			if deploy.NotStartedAt(time.Now()) {
++				return nil, nil, nil
++			}
+ 			if deploy.MaxDevices > 0 &&
+ 				deploy.DeviceCount != nil &&
+ 				*deploy.DeviceCount >= deploy.MaxDevices {
+diff --git a/backend/services/deployments/app/schedule_liubiao_test.go b/backend/services/deployments/app/schedule_liubiao_test.go
+new file mode 100644
+index 00000000..eae3f9e6
+--- /dev/null
++++ b/backend/services/deployments/app/schedule_liubiao_test.go
+@@ -0,0 +1,101 @@
++// Copyright 2026 Skyris liubiao
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++package app
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/mock"
++
++	"github.com/mendersoftware/mender-server/services/deployments/model"
++	"github.com/mendersoftware/mender-server/services/deployments/store/mocks"
++	"github.com/mendersoftware/mender-server/services/deployments/store/mongo"
++)
++
++// liubiao：设备取更新时，未到开始时间的计划部署不下发、不建设备部署记录，
++// 也不跳过它去取更新的部署。
++func TestGetNewDeploymentForDeviceSchedule(t *testing.T) {
++	t.Parallel()
++	future := time.Now().Add(time.Hour)
++	past := time.Now().Add(-time.Hour)
++	created := time.Now().Add(-2 * time.Hour)
++
++	newDeployment := func(start *time.Time) *model.Deployment {
++		var phases []model.DeploymentPhase
++		if start != nil {
++			phases = []model.DeploymentPhase{{StartTs: start}}
++		}
++		return &model.Deployment{
++			DeploymentConstructor: &model.DeploymentConstructor{
++				Name: "foo", ArtifactName: "bar", Phases: phases,
++			},
++			Id:          "dep",
++			Created:     &created,
++			DeviceCount: intPtr(0),
++			MaxDevices:  1,
++			DeviceList:  []string{"dev"},
++			Status:      model.DeploymentStatusPending,
++			Stats:       model.NewDeviceDeploymentStats(),
++		}
++	}
++
++	testCases := map[string]struct {
++		start    *time.Time
++		assigned bool
++	}{
++		"not started yet: hold back": {start: &future},
++		"start passed: assign":       {start: &past, assigned: true},
++		"immediate: assign":          {assigned: true},
++	}
++	for name, tc := range testCases {
++		tc := tc
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			ctx := context.Background()
++			db := &mocks.DataStore{}
++			db.On("FindLatestInactiveDeviceDeployment", ctx, "dev").
++				Return(nil, nil)
++			db.On("FindNewerActiveDeployment", ctx, mock.AnythingOfType("*time.Time"), "dev").
++				Return(newDeployment(tc.start), nil).Once()
++			if tc.assigned {
++				db.On("GetDeviceDeployment", ctx, "dep", "dev", true).
++					Return(nil, mongo.ErrStorageNotFound)
++				db.On("InsertDeviceDeployment", ctx,
++					mock.AnythingOfType("*model.DeviceDeployment"), true).Return(nil)
++			}
++
++			ds := NewDeployments(db, nil, 0, false)
++			deployment, deviceDeployment, err := ds.getNewDeploymentForDevice(ctx, "dev")
++			assert.NoError(t, err)
++			if tc.assigned {
++				if assert.NotNil(t, deployment) {
++					assert.Equal(t, "dep", deployment.Id)
++				}
++				if assert.NotNil(t, deviceDeployment) {
++					assert.Equal(t, model.DeviceDeploymentStatusPending, deviceDeployment.Status)
++				}
++			} else {
++				assert.Nil(t, deployment)
++				assert.Nil(t, deviceDeployment)
++				db.AssertNotCalled(t, "InsertDeviceDeployment",
++					mock.Anything, mock.Anything, mock.Anything)
++			}
++			db.AssertExpectations(t)
++		})
++	}
++}
+diff --git a/backend/services/deployments/config/config.go b/backend/services/deployments/config/config.go
+index f89c9d59..1d6374f5 100644
+--- a/backend/services/deployments/config/config.go
++++ b/backend/services/deployments/config/config.go
+@@ -114,6 +114,12 @@ const (
+ 	SettingReportingAddr        = "reporting_addr"
+ 	SettingReportingAddrDefault = ""
+ 
++	// liubiao: 计划部署的开始时间最多可以设在多久之后（Go duration 格式，如 72h）。
++	// 未开始的计划部署会挡住同一批设备上之后创建的部署，上限越短，影响窗口越短。
++	// 环境变量 DEPLOYMENTS_SCHEDULE_MAX_AHEAD
++	SettingScheduleMaxAhead        = "schedule_max_ahead"
++	SettingScheduleMaxAheadDefault = "72h"
++
+ 	SettingInventoryTimeout        = "inventory_timeout"
+ 	SettingInventoryTimeoutDefault = 10
+ 
+@@ -310,6 +316,7 @@ var (
+ 		{Key: SettingsAwsTagArtifact, Value: SettingsAwsTagArtifactDefault},
+ 		{Key: SettingInventoryAddr, Value: SettingInventoryAddrDefault},
+ 		{Key: SettingReportingAddr, Value: SettingReportingAddrDefault},
++		{Key: SettingScheduleMaxAhead, Value: SettingScheduleMaxAheadDefault},
+ 		{Key: SettingInventoryTimeout, Value: SettingInventoryTimeoutDefault},
+ 		{Key: SettingPresignAlgorithm, Value: SettingPresignAlgorithmDefault},
+ 		{Key: SettingPresignSecret, Value: SettingPresignSecretDefault},
+diff --git a/backend/services/deployments/model/deployment.go b/backend/services/deployments/model/deployment.go
+index 0693d72c..eb6c20a8 100644
+--- a/backend/services/deployments/model/deployment.go
++++ b/backend/services/deployments/model/deployment.go
+@@ -90,6 +90,9 @@ type DeploymentConstructor struct {
+ 
+ 	// When set the deployment will be created for all accepted devices from a given group
+ 	Group string `json:"-" bson:"-"`
++
++	// liubiao: 计划部署的阶段定义（只支持一个阶段，见 deployment_schedule.go）
++	Phases []DeploymentPhase `json:"phases,omitempty" bson:"phases,omitempty"`
+ }
+ 
+ // Validate checks structure according to valid tags
+@@ -262,14 +265,20 @@ func (d *Deployment) MarshalJSON() ([]byte, error) {
+ 		*Alias
+ 		Devices []string       `json:"devices,omitempty"`
+ 		Type    DeploymentType `json:"type,omitempty"`
++		// liubiao: 未到开始时间的计划部署对外显示为 scheduled（数据库中仍是 pending）
++		Status DeploymentStatus `json:"status"`
+ 	}{
+ 		Alias:   (*Alias)(d),
+ 		Devices: nil,
+ 		Type:    d.Type,
++		Status:  d.Status,
+ 	}
+ 	if slim.Type == "" {
+ 		slim.Type = DeploymentTypeSoftware
+ 	}
++	if d.Status == DeploymentStatusPending && d.NotStartedAt(time.Now()) {
++		slim.Status = DeploymentStatusScheduled
++	}
+ 	slim.Statistics.Status = slim.Stats
+ 
+ 	return json.Marshal(&slim)
+@@ -326,6 +335,8 @@ const (
+ 	StatusQueryInProgress
+ 	StatusQueryFinished
+ 	StatusQueryAborted
++	// liubiao: 未到开始时间的计划部署（追加在末尾，不改变已有取值）
++	StatusQueryScheduled
+ 
+ 	SortDirectionAscending  = "asc"
+ 	SortDirectionDescending = "desc"
+diff --git a/backend/services/deployments/model/deployment_schedule.go b/backend/services/deployments/model/deployment_schedule.go
+new file mode 100644
+index 00000000..a1a52fa0
+--- /dev/null
++++ b/backend/services/deployments/model/deployment_schedule.go
+@@ -0,0 +1,87 @@
++// Copyright 2026 Skyris liubiao
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++// liubiao：计划部署（单阶段定时开始），仿照 Mender 企业版的做法：
++// 部署在创建时就写入数据库，设备在开始时间之前取更新时不下发；
++// 到点后由设备下一次轮询取走。只支持一个阶段，不支持分批发布。
++
++package model
++
++import (
++	"time"
++
++	"github.com/pkg/errors"
++)
++
++// DeploymentStatusScheduled 只用于 API 输出和列表查询，不写入数据库；
++// 数据库中未开始的计划部署状态仍是 pending。
++const DeploymentStatusScheduled DeploymentStatus = "scheduled"
++
++// ScheduleBatchSizeAll 是单阶段计划部署唯一允许的批次比例。
++const ScheduleBatchSizeAll = 100
++
++// DeploymentPhase 与企业版 API 的阶段字段兼容（只取开源需要的部分）。
++// 前端会额外发送 delay 等字段，解码时忽略。
++type DeploymentPhase struct {
++	// BatchSize 本阶段覆盖的设备百分比；计划部署只允许不填或 100
++	BatchSize *int `json:"batch_size,omitempty" bson:"batch_size,omitempty"`
++	// StartTs 本阶段开始时间；不填表示立即开始
++	StartTs *time.Time `json:"start_ts,omitempty" bson:"start_ts,omitempty"`
++}
++
++var (
++	ErrScheduleMultiplePhases = errors.New(
++		"计划部署只支持一个阶段（定时开始），不支持分批发布")
++	ErrScheduleBatchSize = errors.New(
++		"计划部署的阶段必须覆盖全部设备（batch_size 不填或为 100）")
++)
++
++// StartTime 返回计划开始时间；没有设置时返回 nil（立即开始）。
++func (c DeploymentConstructor) StartTime() *time.Time {
++	if len(c.Phases) == 0 {
++		return nil
++	}
++	return c.Phases[0].StartTs
++}
++
++// ValidateSchedule 校验计划部署参数：只允许一个覆盖全部设备的阶段，
++// 开始时间不能晚于 now+maxAhead（maxAhead<=0 表示不限制）。
++// 开始时间早于当前时间等同于立即开始，允许提交。
++func (c DeploymentConstructor) ValidateSchedule(now time.Time, maxAhead time.Duration) error {
++	if len(c.Phases) == 0 {
++		return nil
++	}
++	if len(c.Phases) > 1 {
++		return ErrScheduleMultiplePhases
++	}
++	if size := c.Phases[0].BatchSize; size != nil && *size != ScheduleBatchSizeAll {
++		return ErrScheduleBatchSize
++	}
++	start := c.StartTime()
++	if start != nil && maxAhead > 0 && start.After(now.Add(maxAhead)) {
++		return errors.Errorf("计划开始时间最多只能在 %g 小时之后（收到 %s）",
++			maxAhead.Hours(), start.Format(time.RFC3339))
++	}
++	return nil
++}
++
++// NotStartedAt 判断部署在 now 时刻是否仍是未开始的计划部署：
++// 未结束，且设置了晚于 now 的开始时间。
++func (d *Deployment) NotStartedAt(now time.Time) bool {
++	if d == nil || d.DeploymentConstructor == nil || d.Status == DeploymentStatusFinished {
++		return false
++	}
++	start := d.StartTime()
++	return start != nil && start.After(now)
++}
+diff --git a/backend/services/deployments/model/deployment_schedule_test.go b/backend/services/deployments/model/deployment_schedule_test.go
+new file mode 100644
+index 00000000..2409e864
+--- /dev/null
++++ b/backend/services/deployments/model/deployment_schedule_test.go
+@@ -0,0 +1,153 @@
++// Copyright 2026 Skyris liubiao
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++package model
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func schedulePhase(start *time.Time, batch *int) []DeploymentPhase {
++	return []DeploymentPhase{{StartTs: start, BatchSize: batch}}
++}
++
++func TestValidateSchedule(t *testing.T) {
++	t.Parallel()
++	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
++	inLimit := now.Add(71 * time.Hour)
++	tooFar := now.Add(73 * time.Hour)
++	past := now.Add(-time.Hour)
++	full := 100
++	half := 50
++
++	testCases := map[string]struct {
++		phases []DeploymentPhase
++		err    string
++	}{
++		"ok, no phases":           {},
++		"ok, within limit":        {phases: schedulePhase(&inLimit, nil)},
++		"ok, batch size 100":      {phases: schedulePhase(&inLimit, &full)},
++		"ok, past start":          {phases: schedulePhase(&past, nil)},
++		"ok, phase without start": {phases: schedulePhase(nil, &full)},
++		"error, too far": {
++			phases: schedulePhase(&tooFar, nil),
++			err:    "计划开始时间最多只能在 72 小时之后",
++		},
++		"error, partial batch": {
++			phases: schedulePhase(&inLimit, &half),
++			err:    ErrScheduleBatchSize.Error(),
++		},
++		"error, two phases": {
++			phases: append(schedulePhase(&inLimit, &half), schedulePhase(&tooFar, nil)...),
++			err:    ErrScheduleMultiplePhases.Error(),
++		},
++	}
++	for name, tc := range testCases {
++		tc := tc
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			c := DeploymentConstructor{Name: "foo", ArtifactName: "bar", Phases: tc.phases}
++			err := c.ValidateSchedule(now, 72*time.Hour)
++			if tc.err == "" {
++				assert.NoError(t, err)
++			} else if assert.Error(t, err) {
++				assert.Contains(t, err.Error(), tc.err)
++			}
++		})
++	}
++
++	t.Run("no limit when maxAhead is zero", func(t *testing.T) {
++		farAway := now.Add(365 * 24 * time.Hour)
++		c := DeploymentConstructor{Phases: schedulePhase(&farAway, nil)}
++		assert.NoError(t, c.ValidateSchedule(now, 0))
++	})
++}
++
++func TestDeploymentNotStartedAndStatusJSON(t *testing.T) {
++	t.Parallel()
++	future := time.Now().Add(time.Hour)
++	past := time.Now().Add(-time.Hour)
++
++	testCases := map[string]struct {
++		start      *time.Time
++		status     DeploymentStatus
++		notStarted bool
++		jsonStatus DeploymentStatus
++	}{
++		"future start, pending": {
++			start: &future, status: DeploymentStatusPending,
++			notStarted: true, jsonStatus: DeploymentStatusScheduled,
++		},
++		"past start, pending": {
++			start: &past, status: DeploymentStatusPending,
++			jsonStatus: DeploymentStatusPending,
++		},
++		"no start, pending": {
++			status: DeploymentStatusPending, jsonStatus: DeploymentStatusPending,
++		},
++		"future start, finished (aborted)": {
++			start: &future, status: DeploymentStatusFinished,
++			jsonStatus: DeploymentStatusFinished,
++		},
++	}
++	for name, tc := range testCases {
++		tc := tc
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			var phases []DeploymentPhase
++			if tc.start != nil {
++				phases = schedulePhase(tc.start, nil)
++			}
++			d, err := NewDeploymentFromConstructor(&DeploymentConstructor{
++				Name: "foo", ArtifactName: "bar", Phases: phases,
++			})
++			assert.NoError(t, err)
++			d.Status = tc.status
++			assert.Equal(t, tc.notStarted, d.NotStartedAt(time.Now()))
++
++			raw, err := json.Marshal(d)
++			assert.NoError(t, err)
++			var out struct {
++				Status DeploymentStatus  `json:"status"`
++				Phases []DeploymentPhase `json:"phases"`
++			}
++			assert.NoError(t, json.Unmarshal(raw, &out))
++			assert.Equal(t, tc.jsonStatus, out.Status)
++			if tc.start != nil && assert.Len(t, out.Phases, 1) {
++				assert.WithinDuration(t, *tc.start, *out.Phases[0].StartTs, time.Second)
++			}
++		})
++	}
++
++	t.Run("nil constructor", func(t *testing.T) {
++		assert.False(t, (&Deployment{}).NotStartedAt(time.Now()))
++	})
++}
++
++// 前端（企业版向导）提交的阶段带 delay 字段，开源解码时应忽略。
++func TestDecodeFrontendSchedulePayload(t *testing.T) {
++	t.Parallel()
++	body := `{"name":"dev","artifact_name":"app-1.0","devices":["d1"],` +
++		`"phases":[{"batch_size":100,"start_ts":"2026-11-20T14:00:00.000Z","delay":0}]}`
++	var c DeploymentConstructor
++	assert.NoError(t, json.Unmarshal([]byte(body), &c))
++	if assert.NotNil(t, c.StartTime()) {
++		assert.Equal(t, time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC), c.StartTime().UTC())
++	}
++	assert.NoError(t, c.ValidateNew())
++}
+diff --git a/backend/services/deployments/server.go b/backend/services/deployments/server.go
+index 2a5c6c17..cebc85d5 100644
+--- a/backend/services/deployments/server.go
++++ b/backend/services/deployments/server.go
+@@ -203,7 +203,8 @@ func RunServer(ctx context.Context) error {
+ 		SetEnableDirectUpload(c.GetBool(dconfig.SettingStorageEnableDirectUpload)).
+ 		SetEnableDirectUploadSkipVerify(c.GetBool(dconfig.SettingStorageDirectUploadSkipVerify)).
+ 		SetDisableNewReleasesFeature(c.GetBool(dconfig.SettingDisableNewReleasesFeature)).
+-		SetMaxRequestSize(c.GetInt64(dconfig.SettingMaxRequestSize))
++		SetMaxRequestSize(c.GetInt64(dconfig.SettingMaxRequestSize)).
++		SetScheduleMaxAhead(c.GetDuration(dconfig.SettingScheduleMaxAhead))
+ 	if key, err := base64.RawStdEncoding.DecodeString(
+ 		base64Repl.Replace(
+ 			c.GetString(dconfig.SettingPresignSecret),
+diff --git a/backend/services/deployments/store/mongo/datastore_mongo.go b/backend/services/deployments/store/mongo/datastore_mongo.go
+index 2a559510..c0f2d3e2 100644
+--- a/backend/services/deployments/store/mongo/datastore_mongo.go
++++ b/backend/services/deployments/store/mongo/datastore_mongo.go
+@@ -428,6 +428,8 @@ const (
+ 	StorageKeyDeploymentMaxDevices          = "max_devices"
+ 	StorageKeyDeploymentType                = "type"
+ 	StorageKeyDeploymentTotalSize           = "statistics.total_size"
++	// liubiao: 计划部署开始时间（单阶段）
++	StorageKeyDeploymentStartTs = "deploymentconstructor.phases.0.start_ts"
+ 
+ 	StorageKeyStorageSettingsDefaultID      = "settings"
+ 	StorageKeyStorageSettingsBucket         = "bucket"
+@@ -2773,7 +2775,8 @@ func (db *DataStoreMongo) buildDeploymentsQuery(
+ 	// build deployment by status part of the query
+ 	if match.Status != model.StatusQueryAny {
+ 		var status model.DeploymentStatus
+-		if match.Status == model.StatusQueryPending {
++		if match.Status == model.StatusQueryPending ||
++			match.Status == model.StatusQueryScheduled {
+ 			status = model.DeploymentStatusPending
+ 		} else if match.Status == model.StatusQueryInProgress {
+ 			status = model.DeploymentStatusInProgress
+@@ -2782,6 +2785,14 @@ func (db *DataStoreMongo) buildDeploymentsQuery(
+ 		}
+ 		stq := bson.M{StorageKeyDeploymentStatus: status}
+ 		andq = append(andq, stq)
++
++		// liubiao: scheduled 只含未到开始时间的部署，pending 排除它们
++		notStarted := bson.M{StorageKeyDeploymentStartTs: bson.M{"$gt": time.Now()}}
++		if match.Status == model.StatusQueryScheduled {
++			andq = append(andq, notStarted)
++		} else if match.Status == model.StatusQueryPending {
++			andq = append(andq, bson.M{"$nor": []bson.M{notStarted}})
++		}
+ 	}
+ 
+ 	// build deployment by type part of the query
+diff --git a/backend/services/deployments/store/mongo/schedule_liubiao_test.go b/backend/services/deployments/store/mongo/schedule_liubiao_test.go
+new file mode 100644
+index 00000000..9ddbf425
+--- /dev/null
++++ b/backend/services/deployments/store/mongo/schedule_liubiao_test.go
+@@ -0,0 +1,84 @@
++// Copyright 2026 Skyris liubiao
++//
++//    Licensed under the Apache License, Version 2.0 (the "License");
++//    you may not use this file except in compliance with the License.
++//    You may obtain a copy of the License at
++//
++//        http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS,
++//    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++//    See the License for the specific language governing permissions and
++//    limitations under the License.
++
++package mongo
++
++import (
++	"context"
++	"sort"
++	"testing"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/stretchr/testify/assert"
++
++	"github.com/mendersoftware/mender-server/services/deployments/model"
++)
++
++// liubiao：status=scheduled 只返回未到开始时间且未结束的部署，status=pending 排除它们。
++func TestFindDeploymentsScheduledStatus(t *testing.T) {
++	if testing.Short() {
++		t.Skip("skipping TestFindDeploymentsScheduledStatus in short mode.")
++	}
++	db.Wipe()
++	ctx := context.Background()
++	ds := NewDataStoreMongoWithClient(db.Client())
++
++	future := time.Now().Add(2 * time.Hour)
++	past := time.Now().Add(-2 * time.Hour)
++	insert := func(name string, start *time.Time, status model.DeploymentStatus) {
++		var phases []model.DeploymentPhase
++		if start != nil {
++			phases = []model.DeploymentPhase{{StartTs: start}}
++		}
++		d, err := model.NewDeploymentFromConstructor(&model.DeploymentConstructor{
++			Name:         name,
++			ArtifactName: "app-1.0",
++			Devices:      []string{uuid.NewString()},
++			Phases:       phases,
++		})
++		assert.NoError(t, err)
++		d.Id = uuid.NewString()
++		d.Status = status
++		assert.NoError(t, ds.InsertDeployment(ctx, d))
++	}
++	insert("scheduled", &future, model.DeploymentStatusPending)
++	insert("started", &past, model.DeploymentStatusPending)
++	insert("immediate", nil, model.DeploymentStatusPending)
++	insert("aborted-scheduled", &future, model.DeploymentStatusFinished)
++
++	names := func(status model.StatusQuery) []string {
++		deployments, count, err := ds.FindDeployments(ctx, model.Query{Status: status})
++		assert.NoError(t, err)
++		out := make([]string, 0, len(deployments))
++		for _, d := range deployments {
++			out = append(out, d.Name)
++		}
++		sort.Strings(out)
++		assert.Equal(t, int64(len(out)), count)
++		return out
++	}
++	assert.Equal(t, []string{"scheduled"}, names(model.StatusQueryScheduled))
++	assert.Equal(t, []string{"immediate", "started"}, names(model.StatusQueryPending))
++	assert.Equal(t, []string{"aborted-scheduled"}, names(model.StatusQueryFinished))
++	assert.Len(t, names(model.StatusQueryAny), 4)
++
++	// 读回的计划部署保留开始时间，对外显示 scheduled
++	deployments, _, err := ds.FindDeployments(ctx, model.Query{Status: model.StatusQueryScheduled})
++	assert.NoError(t, err)
++	if assert.Len(t, deployments, 1) && assert.NotNil(t, deployments[0].StartTime()) {
++		assert.WithinDuration(t, future, *deployments[0].StartTime(), time.Second)
++		assert.True(t, deployments[0].NotStartedAt(time.Now()))
++	}
++}

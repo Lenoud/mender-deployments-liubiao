@@ -1,0 +1,70 @@
+# mender-deployments-liubiao：上游 v4.1.4 原样源码 + liubiao/patches 构建时补丁。
+# 项目设置的 CI 配置路径为 liubiao/.gitlab-ci.yml；根目录 .gitlab-ci.yml 是上游自己的流水线，不使用。
+# MR 只验证与构建；受保护 main 构建并推送 Harbor（Harbor 凭据为实例级受保护变量）。
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - verify
+  - test
+  - build
+
+verify-upstream-baseline:
+  stage: verify
+  image: harbor.skyrisai.com/dockerhub-daocloud/library/golang:1.26.5
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - sh liubiao/verify.sh
+
+# 镜像构建里只跑不依赖数据库的单测（与 Jenkins 一致）；补丁改了 Mongo 查询，
+# 这里用临时 MongoDB（与生产同为 8.0.28）跑 deployments 全部存储测试，包括上游原有用例。
+test-deployments-mongo:
+  stage: test
+  needs:
+    - verify-upstream-baseline
+  image: harbor.skyrisai.com/dockerhub-daocloud/library/golang:1.26.5
+  services:
+    - name: harbor.skyrisai.com/dockerhub-daocloud/library/mongo:8.0.28
+      alias: mongo
+  variables:
+    TEST_MONGO_URL: mongodb://mongo:27017
+    GOTOOLCHAIN: local
+    GOPROXY: https://goproxy.cn,direct
+    GOFLAGS: -buildvcs=false
+  script:
+    - for patch in liubiao/patches/*.patch; do git apply --check "$patch"; git apply "$patch"; echo "已应用补丁：$patch"; done
+    - cd backend
+    - go test -tags nopkcs11 -count=1 -p 1 -timeout 1200s ./services/deployments/store/mongo/...
+    - go test -tags nopkcs11 -count=1 -v -run 'TestFindDeploymentsScheduledStatus' ./services/deployments/store/mongo/ | grep -E '^(--- |ok|FAIL)'
+
+include:
+  - component: git.skyrisai.com/origin/tech/cicd/gitlab-ci-components/docker-build@0.6.0
+    inputs:
+      job_name: build-deployments-image
+      stage: build
+      image_repository: harbor.skyrisai.com/develop/mender-deployments-liubiao
+      dockerfile: liubiao/Dockerfile
+      context: .
+      platform: linux/amd64
+      build_args_file: .ci-build.args
+      push_image: false
+      tag_prefix: upstream-4.1.4
+
+build-deployments-image:
+  needs:
+    - verify-upstream-baseline
+    - test-deployments-mongo
+  # 构建参数只含版本号，不含敏感信息；生成的文件不入库，也不进入构建上下文。
+  before_script:
+    - . liubiao/upstream.env
+    - printf 'SOURCE_VERSION=%s+liubiao.%s\n' "${UPSTREAM_TAG}" "${CI_COMMIT_SHORT_SHA}" > .ci-build.args
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_REF_PROTECTED == "true"
+      variables:
+        COMPONENT_PUSH_IMAGE: "true"
